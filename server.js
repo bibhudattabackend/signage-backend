@@ -3,11 +3,27 @@ const mongoose = require('mongoose')
 const cors = require('cors')
 const multer = require('multer')
 const path = require('path')
+const fs = require('fs')
 const http = require('http')
 const { Server } = require('socket.io')
 const bcrypt = require('bcryptjs')
 const jwt = require('jsonwebtoken')
+const cloudinary = require('cloudinary').v2
 require('dotenv').config()
+
+function initCloudinary() {
+  const n = process.env.CLOUDINARY_CLOUD_NAME
+  const k = process.env.CLOUDINARY_API_KEY
+  const s = process.env.CLOUDINARY_API_SECRET
+  if (n && k && s) {
+    cloudinary.config({ cloud_name: n, api_key: k, api_secret: s })
+    console.log('✅ Cloudinary configured')
+    return true
+  }
+  console.warn('⚠️  Set CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET — playlist uploads will fail until then')
+  return false
+}
+const cloudinaryReady = initCloudinary()
 
 const Playlist = require('./models/Playlist')
 const Device = require('./models/Device')
@@ -34,7 +50,7 @@ app.use('/uploads', express.static('uploads'))
 const PORT = process.env.PORT || 3000
 const JWT_SECRET = process.env.JWT_SECRET
 if (!JWT_SECRET) throw new Error('JWT_SECRET must be set in .env')
-const BASE_URL = process.env.BASE_URL || `http://192.168.31.73:${PORT}`
+// const BASE_URL = process.env.BASE_URL || `http://192.168.31.73:${PORT}`
 
 function requirePlayerJwt() {
   const v = process.env.REQUIRE_PLAYER_JWT
@@ -106,10 +122,13 @@ mongoose
   .then(() => console.log('✅ MongoDB Connected'))
   .catch((err) => console.log('❌ DB Error:', err))
 
+const tmpUploadDir = path.join('uploads', 'tmp')
+fs.mkdirSync(tmpUploadDir, { recursive: true })
+
 const storage = multer.diskStorage({
-  destination: './uploads/',
+  destination: tmpUploadDir,
   filename: (req, file, cb) => {
-    cb(null, Date.now() + path.extname(file.originalname))
+    cb(null, `${Date.now()}-${Math.random().toString(16).slice(2)}${path.extname(file.originalname || '')}`)
   }
 })
 
@@ -184,6 +203,40 @@ function resolvePlaylistFileType(file) {
   if (mime.startsWith('image')) return 'image'
   if (PLAYER_IMAGE_EXT.has(ext)) return 'image'
   return 'image'
+}
+
+/** Upload temp disk file to Cloudinary; deletes local file always */
+async function uploadLocalFileToCloudinary(file) {
+  const fileType = resolvePlaylistFileType(file)
+  const resourceType = fileType === 'video' ? 'video' : 'image'
+  const folder = (process.env.CLOUDINARY_FOLDER || 'nexus-signage').replace(/^\/+|\/+$/g, '')
+  const opts = {
+    folder,
+    resource_type: resourceType,
+    use_filename: true,
+    unique_filename: true,
+    overwrite: false
+  }
+  let result
+  try {
+    const stat = await fs.promises.stat(file.path)
+    const largeVideo = resourceType === 'video' && stat.size > 90 * 1024 * 1024
+    if (largeVideo) {
+      result = await new Promise((resolve, reject) => {
+        cloudinary.uploader.upload_large(
+          file.path,
+          (err, r) => (err ? reject(err) : resolve(r)),
+          { ...opts, chunk_size: 6 * 1024 * 1024 }
+        )
+      })
+    } else {
+      result = await cloudinary.uploader.upload(file.path, opts)
+    }
+  } finally {
+    await fs.promises.unlink(file.path).catch(() => { })
+  }
+  if (!result?.secure_url) throw new Error('Cloudinary did not return secure_url')
+  return result.secure_url
 }
 
 const upload = multer({
@@ -301,24 +354,38 @@ app.post('/api/login', async (req, res) => {
 })
 
 app.post('/api/playlists', verifyToken, upload.array('files'), async (req, res) => {
+  if (!cloudinaryReady) {
+    return res.status(503).json({
+      error: 'Cloudinary is not configured. Set CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET on the server.'
+    })
+  }
   try {
     const { name, durations, rotations } = req.body
     const parsedDurations = JSON.parse(durations || '[]')
     const parsedRotations = JSON.parse(rotations || '[]')
 
-    const items = req.files.map((file, index) => ({
-      fileUrl: `${BASE_URL}/uploads/${file.filename}`,
-      fileType: resolvePlaylistFileType(file),
-      duration: parsedDurations[index] || 10,
-      rotation: Number(parsedRotations[index]) || 0,
-      order: index
-    }))
+    const files = req.files || []
+    const items = []
+    for (let index = 0; index < files.length; index++) {
+      const file = files[index]
+      const secureUrl = await uploadLocalFileToCloudinary(file)
+      items.push({
+        fileUrl: secureUrl,
+        fileType: resolvePlaylistFileType(file),
+        duration: parsedDurations[index] || 10,
+        rotation: Number(parsedRotations[index]) || 0,
+        order: index
+      })
+    }
 
     const newPlaylist = new Playlist({ name, items })
     await newPlaylist.save()
     res.status(201).json(newPlaylist)
   } catch (err) {
-    res.status(500).json({ error: err.message })
+    for (const f of req.files || []) {
+      await fs.promises.unlink(f.path).catch(() => { })
+    }
+    res.status(500).json({ error: err.message || 'Upload failed' })
   }
 })
 
