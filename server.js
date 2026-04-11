@@ -113,43 +113,76 @@ const storage = multer.diskStorage({
   }
 })
 
-const MOBILE_IMAGE_MIMES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp'])
-const MOBILE_VIDEO_MIMES = new Set(['video/mp4', 'video/quicktime', 'video/x-m4v'])
-const MOBILE_VIDEO_EXT = new Set(['.mp4', '.m4v', '.mov'])
+/** Video extensions we treat as playlist video (incl. octet-stream uploads) */
+const PLAYER_VIDEO_EXT = new Set([
+  '.mp4',
+  '.m4v',
+  '.mov',
+  '.webm',
+  '.mkv',
+  '.avi',
+  '.wmv',
+  '.flv',
+  '.3gp',
+  '.3g2',
+  '.ogv',
+  '.mpeg',
+  '.mpg',
+  '.ts',
+  '.m2ts',
+  '.f4v',
+  '.asf'
+])
+
+/** Image extensions when browser sends octet-stream or empty MIME */
+const PLAYER_IMAGE_EXT = new Set([
+  '.jpg',
+  '.jpeg',
+  '.png',
+  '.gif',
+  '.webp',
+  '.bmp',
+  '.svg',
+  '.ico',
+  '.heic',
+  '.heif',
+  '.avif',
+  '.tif',
+  '.tiff'
+])
 
 function isAllowedPlayerUpload(file) {
   const ext = path.extname(file.originalname || '').toLowerCase()
   const mime = (file.mimetype || '').toLowerCase()
 
-  if (MOBILE_IMAGE_MIMES.has(mime)) return { ok: true }
-  if (mime.startsWith('image/')) {
+  if (mime.startsWith('image/')) return { ok: true }
+  if (mime.startsWith('video/')) return { ok: true }
+
+  if (mime === 'application/octet-stream' || mime === '') {
+    if (PLAYER_VIDEO_EXT.has(ext)) return { ok: true }
+    if (PLAYER_IMAGE_EXT.has(ext)) return { ok: true }
+    if (!ext || ext === '.') {
+      return {
+        ok: false,
+        msg: 'Unknown file: use a normal extension (.mp4, .jpg, etc.) so the server can detect image vs video.'
+      }
+    }
     return {
       ok: false,
-      msg: 'Unsupported upload: use JPEG, PNG, GIF, or WebP images (no SVG/HEIC/etc.).'
+      msg: `Unrecognized extension "${ext}". Rename to a known image or video type, or upload from a browser that sends Content-Type.`
     }
   }
 
-  if (!MOBILE_VIDEO_EXT.has(ext)) {
-    return {
-      ok: false,
-      msg: 'Unsupported upload: video must be .mp4, .mov, or .m4v (H.264 + AAC recommended). WebM/AVI/MKV etc. are blocked for mobile players.'
-    }
-  }
-
-  if (MOBILE_VIDEO_MIMES.has(mime)) return { ok: true }
-  if (mime === 'application/octet-stream' || mime === '') return { ok: true }
-
-  return {
-    ok: false,
-    msg: 'Unsupported upload: video type does not match a safe mobile format. Re-encode as MP4 (H.264 + AAC) or export as .mov.'
-  }
+  return { ok: false, msg: `Unsupported type "${mime || 'empty'}". Use an image or video file.` }
 }
 
 function resolvePlaylistFileType(file) {
   const mime = (file.mimetype || '').toLowerCase()
-  if (mime.startsWith('video')) return 'video'
   const ext = path.extname(file.originalname || '').toLowerCase()
-  if (MOBILE_VIDEO_EXT.has(ext)) return 'video'
+  if (mime.startsWith('video')) return 'video'
+  if (PLAYER_VIDEO_EXT.has(ext)) return 'video'
+  if (mime.startsWith('image')) return 'image'
+  if (PLAYER_IMAGE_EXT.has(ext)) return 'image'
   return 'image'
 }
 
