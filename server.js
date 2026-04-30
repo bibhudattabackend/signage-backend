@@ -28,6 +28,7 @@ const cloudinaryReady = initCloudinary()
 const Playlist = require('./models/Playlist')
 const Device = require('./models/Device')
 const Admin = require('./models/Admin')
+const MediaAnalytics = require('./models/MediaAnalytics')
 
 const app = express()
 const server = http.createServer(app)
@@ -309,6 +310,33 @@ io.on('connection', (socket) => {
     }
   })
 
+  socket.on('track-media-play', async ({ deviceId, playlistId, itemId, fileUrl, fileType, rotation, duration }) => {
+    if (requirePlayerJwt() && socket.playerJwtDeviceId && socket.playerJwtDeviceId !== deviceId) return
+    if (!deviceId || !playlistId || !itemId || !fileUrl || !fileType) return
+    if (!mongoose.Types.ObjectId.isValid(String(playlistId))) return
+    try {
+      const key = `perDevicePlays.${deviceId}`
+      await MediaAnalytics.findOneAndUpdate(
+        { playlistId, itemId },
+        {
+          // Don't set the same path in $setOnInsert and $set (Mongo throws ConflictingUpdateOperators)
+          $setOnInsert: { playlistId, itemId },
+          $set: {
+            fileUrl,
+            fileType,
+            rotation: Number(rotation) || 0,
+            duration: Number(duration) || 10,
+            lastPlayedAt: new Date()
+          },
+          $inc: { totalPlays: 1, [key]: 1 }
+        },
+        { upsert: true, new: true }
+      )
+    } catch (err) {
+      console.error('❌ Media analytics update failed:', err)
+    }
+  })
+
   socket.on('disconnect', async () => {
     if (!socket.deviceId) return
     const dId = socket.deviceId
@@ -395,6 +423,66 @@ app.get('/api/playlists', verifyToken, async (req, res) => {
     res.json(playlists)
   } catch (err) {
     res.status(500).json({ error: err.message })
+  }
+})
+
+app.post('/api/playlists/from-library', verifyToken, async (req, res) => {
+  try {
+    const { name, items } = req.body || {}
+    if (!name || typeof name !== 'string') return res.status(400).json({ error: 'name is required' })
+    if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: 'items must be a non-empty array' })
+    const normalized = items
+      .filter((x) => x && typeof x.fileUrl === 'string' && x.fileUrl.trim())
+      .map((x, i) => ({
+        fileUrl: String(x.fileUrl).trim(),
+        fileType: x.fileType === 'image' ? 'image' : 'video',
+        duration: Number(x.duration) > 0 ? Math.min(3600, Math.floor(Number(x.duration))) : 10,
+        rotation: [0, 90, 180, 270].includes(Number(x.rotation)) ? Number(x.rotation) : 0,
+        order: i
+      }))
+    if (normalized.length === 0) return res.status(400).json({ error: 'No valid items' })
+    const newPlaylist = new Playlist({ name, items: normalized })
+    await newPlaylist.save()
+    res.status(201).json(newPlaylist)
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'Failed to create playlist' })
+  }
+})
+
+app.patch('/api/playlists/:id', verifyToken, async (req, res) => {
+  try {
+    const { id } = req.params
+    if (!mongoose.Types.ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid id' })
+    const { name, items } = req.body || {}
+
+    const update = {}
+    if (typeof name === 'string' && name.trim()) update.name = name.trim()
+
+    if (Array.isArray(items)) {
+      update.items = items.map((x, i) => ({
+        _id: x._id, // allow preserving subdoc IDs when present
+        fileUrl: String(x.fileUrl || '').trim(),
+        fileType: x.fileType === 'image' ? 'image' : 'video',
+        duration: Number(x.duration) > 0 ? Math.min(3600, Math.floor(Number(x.duration))) : 10,
+        rotation: [0, 90, 180, 270].includes(Number(x.rotation)) ? Number(x.rotation) : 0,
+        order: i
+      }))
+    }
+
+    const updated = await Playlist.findByIdAndUpdate(id, update, { new: true })
+    if (!updated) return res.status(404).json({ error: 'Playlist not found' })
+
+    if (Array.isArray(items)) {
+      const keepIds = (updated.items || [])
+        .map((it) => String(it._id))
+        .filter((x) => mongoose.Types.ObjectId.isValid(x))
+        .map((x) => new mongoose.Types.ObjectId(x))
+      await MediaAnalytics.deleteMany({ playlistId: id, itemId: { $nin: keepIds } }).catch(() => {})
+    }
+
+    res.json(updated)
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'Failed to update playlist' })
   }
 })
 
@@ -498,7 +586,27 @@ app.get('/api/player/:deviceId', verifyPlayerRequest, async (req, res) => {
   if (!device || !device.assignedPlaylist) {
     return res.status(404).json({ message: 'Empty' })
   }
-  res.json(device.assignedPlaylist.items)
+  // Include playlistId so player can report media-wise analytics
+  const playlistId = device.assignedPlaylist._id
+  const items = (device.assignedPlaylist.items || []).map((it) => ({
+    ...it.toObject(),
+    playlistId
+  }))
+  res.json(items)
+})
+
+app.get('/api/reports/media', verifyToken, async (req, res) => {
+  try {
+    const { playlistId } = req.query || {}
+    const filter = {}
+    if (playlistId && mongoose.Types.ObjectId.isValid(String(playlistId))) {
+      filter.playlistId = playlistId
+    }
+    const rows = await MediaAnalytics.find(filter).sort({ totalPlays: -1, lastPlayedAt: -1 }).limit(5000).lean()
+    res.json(rows)
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'Failed to build media report' })
+  }
 })
 
 app.use((err, req, res, next) => {
